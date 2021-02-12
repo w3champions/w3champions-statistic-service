@@ -1,7 +1,10 @@
 ﻿using System.Threading.Tasks;
+using System.Collections.Generic;
+using System.Linq;
 using Microsoft.AspNetCore.Mvc;
 using MongoDB.Bson;
 using W3ChampionsStatisticService.CommonValueObjects;
+using W3ChampionsStatisticService.PersonalSettings;
 using W3ChampionsStatisticService.Ports;
 
 namespace W3ChampionsStatisticService.Matches
@@ -12,11 +15,16 @@ namespace W3ChampionsStatisticService.Matches
     {
         private readonly IMatchRepository _matchRepository;
         private readonly MatchQueryHandler _matchQueryHandler;
+        private readonly IPersonalSettingsRepository _personalSettingsRepository;
 
-        public MatchesController(IMatchRepository matchRepository, MatchQueryHandler matchQueryHandler)
+        public MatchesController(
+            IMatchRepository matchRepository,
+            MatchQueryHandler matchQueryHandler,
+            IPersonalSettingsRepository personalSettingsRepository)
         {
             _matchRepository = matchRepository;
             _matchQueryHandler = matchQueryHandler;
+            _personalSettingsRepository = personalSettingsRepository;
         }
 
         [HttpGet("")]
@@ -30,8 +38,69 @@ namespace W3ChampionsStatisticService.Matches
             if (pageSize > 100) pageSize = 100;
             var matches = await _matchRepository.Load(gateWay, gameMode, offset, pageSize, map);
             var count = await _matchRepository.Count(gateWay, gameMode, map);
+
+            await AssignLocationsToMatchups(matches);
+
+
             return Ok(new { matches, count });
         }
+
+        private async Task<List<Matchup>> AssignLocationsToMatchups(List<Matchup> matches)
+        {
+            var battleTags = new List<string>();
+            var players = new Dictionary<PlayerOverviewMatches, Matchup>();
+            var matchesToUpdate = new HashSet<Matchup>();
+
+            // Get all the players for the matches that are missing
+            // location or country code.
+
+            foreach (var match in matches)
+            {
+                foreach (var team in match.Teams)
+                {
+                    foreach (var player in team.Players)
+                    {
+                        if (player.Location == null && player.CountryCode == null)
+                        {
+                            players.Add(player, match);
+                            battleTags.Add(player.BattleTag);
+                        }
+
+                    }
+                }
+            }
+
+            // Bulk load their personal settings as <BattleTag, PersonalSettings> dict
+
+            var personalSettings =
+                (await _personalSettingsRepository.LoadMany(battleTags.ToArray()))
+                    .ToDictionary(ps => ps.Id, ps => ps);
+
+
+            // Try to fill in location with their personal settings data
+            foreach (var player in players)
+            {
+                if (personalSettings.TryGetValue(player.Key.BattleTag, out PersonalSetting ps))
+                {
+                    player.Key.CountryCode ??= ps.CountryCode;
+                    player.Key.Location ??= ps.Location;
+                    player.Key.Country ??= ps.Country;
+
+                    // Queue the matchup to be updated
+                    matchesToUpdate.Add(player.Value);
+                }
+            }
+
+
+            // Update all the matches
+            foreach (var match in matchesToUpdate)
+            {
+                await _matchRepository.Insert(match);
+            }
+
+            return matches;
+        }
+
 
         [HttpGet("{id}")]
         public async Task<IActionResult> GetMatcheDetails(string id)
